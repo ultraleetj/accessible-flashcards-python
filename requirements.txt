@@ -1,0 +1,1 @@
+using WX  for an accessible interface. Eventually also using json to implement dictionaries for flashcard management.
