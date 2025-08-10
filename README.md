@@ -1,6 +1,7 @@
 # 📚 Flashcard Study Tool
 
 A simple, accessible flashcard application built with Python and wxPython. Perfect for language learning, studying, and memorization.
+Download: from releases page (windows executable)
 
 ![Python](https://img.shields.io/badge/python-3.7+-blue.svg)
 ![wxPython](https://img.shields.io/badge/wxpython-4.0+-green.svg)
