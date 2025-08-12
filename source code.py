@@ -1,10 +1,13 @@
 import wx
 import random
 import re
+import unicodedata
 from typing import List, Tuple, Optional
 
 class Flashcard:
     """Represents a single flashcard with term and definition."""
+    __slots__ = ('term', 'definition')  # Memory optimization
+    
     def __init__(self, term: str, definition: str):
         self.term = term.strip()
         self.definition = definition.strip()
@@ -25,10 +28,27 @@ class FlashcardManager:
         '⸻': 'three-em dash',    # U+2E3B
     }
     
+    # Precompiled regex patterns for better performance
+    NUMBERING_PATTERNS = [
+        re.compile(r'^\s*\d+\.\s*'),      # "1. term"
+        re.compile(r'^\s*\d+\)\s*'),      # "1) term"
+        re.compile(r'^\s*\d+\s+-\s*'),    # "1 - term"
+        re.compile(r'^\s*\d+\s+'),        # "1 term"
+        re.compile(r'^\s*\(\d+\)\s*'),    # "(1) term"
+    ]
+    
+    HYPHEN_FIX_PATTERN = re.compile(r'(\S)\s*-\s*(\S)')
+    HYPHEN_CONTEXT_PATTERN = re.compile(r'.{0,3}-.{0,3}')
+    MULTIPLE_NUMBERING_PATTERNS = [
+        re.compile(r'\d+\.'),      # "1."
+        re.compile(r'\d+\)'),      # "1)"
+        re.compile(r'\(\d+\)'),    # "(1)"
+    ]
+    
     def __init__(self):
         self.flashcards: List[Flashcard] = []
-        self.parent_window = None  # Will be set by the panel
-        self.debug_window = None   # Will be set when debug window is created
+        self.parent_window = None
+        self.debug_window = None
     
     def set_parent_window(self, parent):
         """Set the parent window for dialogs."""
@@ -36,23 +56,20 @@ class FlashcardManager:
     
     def debug_log(self, message):
         """Log debug message to console and debug window if available."""
-        print(message)  # Always print to console
+        print(message)
         if self.debug_window:
             self.debug_window.log(message)
     
     def _detect_and_fix_dash_variants(self, content: str) -> Tuple[str, List[str]]:
-        """
-        Detect dash variants and optionally replace them.
-        Returns (potentially_modified_content, list_of_replacements_made)
-        """
+        """Detect dash variants and optionally replace them."""
         replacements_made = []
+        found_variants = {}
         
         # Find all dash variants in the content
-        found_variants = {}
         for variant, name in self.DASH_VARIANTS.items():
             if variant in content:
-                # Count occurrences and find example lines
                 count = content.count(variant)
+                # Get first 3 example lines
                 examples = []
                 for line_num, line in enumerate(content.split('\n'), 1):
                     if variant in line and len(examples) < 3:
@@ -67,16 +84,17 @@ class FlashcardManager:
         if not found_variants:
             return content, replacements_made
         
-        # Ask user about replacements
+        # Build message for user
         message_parts = ["Found non-standard dash characters in your flashcard file:\n"]
         
         for variant, info in found_variants.items():
             message_parts.append(f"\n• '{variant}' ({info['name']}) - found {info['count']} time(s)")
-            for example in info['examples']:
-                message_parts.append(f"  {example}")
+            message_parts.extend(f"  {example}" for example in info['examples'])
         
-        message_parts.append(f"\nThese should be replaced with ' - ' (space-hyphen-space) for proper parsing.")
-        message_parts.append(f"Would you like to automatically replace them?")
+        message_parts.extend([
+            "\nThese should be replaced with ' - ' (space-hyphen-space) for proper parsing.",
+            "Would you like to automatically replace them?"
+        ])
         
         dialog = wx.MessageDialog(
             self.parent_window,
@@ -85,120 +103,103 @@ class FlashcardManager:
             wx.YES_NO | wx.ICON_QUESTION
         )
         
-        if dialog.ShowModal() == wx.ID_YES:
-            modified_content = content
-            for variant in found_variants:
-                # Replace variant with standard format, but be smart about spacing
-                # Replace "word[variant]word" with "word - word"
-                pattern = rf'(\S)\s*{re.escape(variant)}\s*(\S)'
-                modified_content = re.sub(pattern, r'\1 - \2', modified_content)
-                replacements_made.append(f"Replaced '{variant}' ({found_variants[variant]['name']})")
-            
-            content = modified_content
+        try:
+            if dialog.ShowModal() == wx.ID_YES:
+                modified_content = content
+                for variant in found_variants:
+                    # Replace variant with standard format
+                    pattern = rf'(\S)\s*{re.escape(variant)}\s*(\S)'
+                    modified_content = re.sub(pattern, r'\1 - \2', modified_content)
+                    replacements_made.append(f"Replaced '{variant}' ({found_variants[variant]['name']})")
+                content = modified_content
+        finally:
+            dialog.Destroy()
         
-        dialog.Destroy()
         return content, replacements_made
     
     def _validate_flashcard_line(self, line: str, line_num: int) -> Tuple[bool, str]:
-        """
-        Validate a flashcard line for severe malformations that should refuse loading.
-        Returns (is_valid, error_message)
-        """
-        import re
-        
-        # Check for multiple numbering patterns (e.g., "2. 2. term - definition")
-        numbering_patterns = [
-            r'\d+\.',      # "1."
-            r'\d+\)',      # "1)"
-            r'\(\d+\)',    # "(1)"
-        ]
-        
+        """Validate a flashcard line for severe malformations."""
+        # Check for multiple numbering patterns
         matches = []
-        for pattern in numbering_patterns:
-            matches.extend(re.findall(pattern, line))
+        for pattern in self.MULTIPLE_NUMBERING_PATTERNS:
+            matches.extend(pattern.findall(line))
         
         if len(matches) > 1:
             return False, f"Multiple numbering patterns found: {matches}"
         
-        # Check for multiple hyphens that could be confusing
-        hyphen_count = line.count('-')
-        en_dash_count = line.count('–')
-        em_dash_count = line.count('—')
-        total_dash_chars = hyphen_count + en_dash_count + em_dash_count
+        # Check for too many dash characters
+        total_dash_chars = sum(line.count(char) for char in ['-', '–', '—'])
         
-        if total_dash_chars > 2:  # Allow for one separator plus one in term/definition
+        if total_dash_chars > 2:
             return False, f"Too many dash characters ({total_dash_chars} found), unclear separation"
         
-        # Check for severely malformed patterns
-        # Pattern like "term definition" with no separator at all
-        if '-' not in line and '–' not in line and '—' not in line:
-            # Skip empty lines or lines that are clearly just headers/comments
+        # Check for missing separator
+        if not any(char in line for char in ['-', '–', '—']):
+            # Skip empty lines or comments
             if line.strip() and not line.strip().startswith('#') and len(line.strip().split()) > 1:
                 return False, "No separator found (missing hyphen/dash)"
         
         return True, ""
-    def _parse_flashcard_line(self, line: str, line_num: int) -> Optional[Flashcard]:
-        """
-        Parse a single line into a flashcard.
-        Valid format: "term - definition" (space-hyphen-space)
-        """
+    
+    def _clean_line(self, line: str) -> str:
+        """Clean line of invisible characters and normalize spaces."""
+        return ''.join(
+            ' ' if unicodedata.category(char) == 'Zs' else char 
+            if char.isprintable() or char == ' ' else '' 
+            for char in line
+        )
+    
+    def _remove_numbering(self, line: str, line_num: int) -> str:
+        """Remove numbering patterns from the beginning of a line."""
         original_line = line
         
-        # First, validate for severe malformations that should refuse loading
+        for pattern in self.NUMBERING_PATTERNS:
+            if pattern.match(line):
+                new_line = pattern.sub('', line)
+                self.debug_log(f"Line {line_num}: Removed numbering pattern")
+                self.debug_log(f"Line {line_num}: Before: {repr(line)}")
+                self.debug_log(f"Line {line_num}: After: {repr(new_line)}")
+                return new_line
+        
+        return line
+    
+    def _fix_hyphen_spacing(self, line: str, line_num: int) -> str:
+        """Fix spacing around hyphens."""
+        separator = ' - '
+        
+        if separator not in line and '-' in line:
+            # Fix patterns like "word -word", "word- word", "word-word"
+            if self.HYPHEN_FIX_PATTERN.search(line):
+                fixed_line = self.HYPHEN_FIX_PATTERN.sub(r'\1 - \2', line)
+                self.debug_log(f"Line {line_num}: Auto-fixed spacing around hyphen")
+                self.debug_log(f"Line {line_num}: Before: {repr(line)}")
+                self.debug_log(f"Line {line_num}: After: {repr(fixed_line)}")
+                return fixed_line
+        
+        return line
+    
+    def _parse_flashcard_line(self, line: str, line_num: int) -> Optional[Flashcard]:
+        """Parse a single line into a flashcard."""
+        original_line = line
+        
+        # Validate for severe malformations
         is_valid, error_msg = self._validate_flashcard_line(line, line_num)
         if not is_valid:
             self.debug_log(f"Line {line_num}: SEVERE MALFORMATION - {error_msg}")
             self.debug_log(f"Line {line_num}: {repr(line)}")
             raise ValueError(f"Line {line_num}: {error_msg} - '{line.strip()}'")
         
-        # Clean the line of any invisible characters (except regular spaces)
-        # Also normalize different types of spaces to regular spaces
-        import unicodedata
-        cleaned_line = ''.join(
-            ' ' if unicodedata.category(char) == 'Zs' else char 
-            if char.isprintable() or char == ' ' else '' 
-            for char in line
-        )
+        # Clean and process the line
+        cleaned_line = self._clean_line(line)
+        cleaned_line = self._remove_numbering(cleaned_line, line_num)
+        cleaned_line = self._fix_hyphen_spacing(cleaned_line, line_num)
         
-        # Remove leading numbers and numbering patterns
-        import re
-        numbering_patterns = [
-            r'^\s*\d+\.\s*',      # "1. term"
-            r'^\s*\d+\)\s*',      # "1) term"
-            r'^\s*\d+\s+-\s*',    # "1 - term" (when number is separate from actual separator)
-            r'^\s*\d+\s+',        # "1 term"
-            r'^\s*\(\d+\)\s*',    # "(1) term"
-        ]
-        
-        original_cleaned = cleaned_line
-        for pattern in numbering_patterns:
-            if re.match(pattern, cleaned_line):
-                new_line = re.sub(pattern, '', cleaned_line)
-                self.debug_log(f"Line {line_num}: Removed numbering pattern")
-                self.debug_log(f"Line {line_num}: Before: {repr(cleaned_line)}")
-                self.debug_log(f"Line {line_num}: After: {repr(new_line)}")
-                cleaned_line = new_line
-                break
-        
-        # Look for the exact pattern: space, hyphen, space
         separator = ' - '
         
-        # Also try to fix common malformed patterns
         if separator not in cleaned_line:
-            # Try to fix patterns like "word -word", "word- word", "word-word"
-            pattern = r'(\S)\s*-\s*(\S)'
-            if re.search(pattern, cleaned_line):
-                # Replace with proper format
-                fixed_line = re.sub(pattern, r'\1 - \2', cleaned_line)
-                self.debug_log(f"Line {line_num}: Auto-fixed spacing around hyphen")
-                self.debug_log(f"Line {line_num}: Before: {repr(cleaned_line)}")
-                self.debug_log(f"Line {line_num}: After: {repr(fixed_line)}")
-                cleaned_line = fixed_line
-        
-        if separator not in cleaned_line:
-            # Debug: show what characters we actually have around hyphens
+            # Debug information
             if '-' in cleaned_line:
-                hyphen_contexts = re.findall(r'.{0,3}-.{0,3}', cleaned_line)
+                hyphen_contexts = self.HYPHEN_CONTEXT_PATTERN.findall(cleaned_line)
                 self.debug_log(f"Line {line_num}: Found hyphens but not ' - '. Contexts: {hyphen_contexts}")
                 self.debug_log(f"Line {line_num}: Original: {repr(original_line)}")
                 self.debug_log(f"Line {line_num}: Cleaned: {repr(cleaned_line)}")
@@ -206,13 +207,13 @@ class FlashcardManager:
                 self.debug_log(f"Line {line_num}: No hyphen found in line: {repr(cleaned_line)}")
             return None
         
-        # Split only on the first occurrence of ' - '
+        # Split on first occurrence of separator
         parts = cleaned_line.split(separator, 1)
         if len(parts) == 2:
             term = parts[0].strip()
             definition = parts[1].strip()
             
-            if term and definition:  # Both parts must be non-empty
+            if term and definition:
                 self.debug_log(f"Line {line_num}: Successfully parsed - Term: '{term}', Definition: '{definition}'")
                 return Flashcard(term, definition)
             else:
@@ -222,11 +223,8 @@ class FlashcardManager:
         
         return None
     
-    def load_from_file(self, filename: str) -> Tuple[bool, List[str]]:
-        """
-        Load flashcards from a file. 
-        Returns (success, list_of_messages, has_issues)
-        """
+    def load_from_file(self, filename: str) -> Tuple[bool, List[str], bool]:
+        """Load flashcards from a file."""
         try:
             with open(filename, 'r', encoding='utf-8') as file:
                 content = file.read()
@@ -240,18 +238,16 @@ class FlashcardManager:
             skipped_lines = []
             processing_issues = []
             
-            # First pass: check for severe malformations that should refuse loading
+            # First pass: validate all lines
             try:
                 for line_num, line in enumerate(lines, 1):
-                    # This will raise ValueError if severely malformed
-                    self._parse_flashcard_line(line, line_num)
+                    self._validate_flashcard_line(line, line_num)
             except ValueError as e:
-                # Severe malformation found - refuse to load the file
                 error_msg = str(e)
                 self.debug_log(f"REFUSING TO LOAD FILE: {error_msg}")
                 return False, [f"File refused due to severe formatting issues:\n{error_msg}\n\nPlease fix the formatting and try again."], True
             
-            # Second pass: actual parsing (we know it won't crash now)
+            # Second pass: parse lines
             for line_num, line in enumerate(lines, 1):
                 try:
                     flashcard = self._parse_flashcard_line(line, line_num)
@@ -260,7 +256,6 @@ class FlashcardManager:
                     else:
                         skipped_lines.append(f"Line {line_num}: {line}")
                 except ValueError:
-                    # This shouldn't happen since we pre-validated, but just in case
                     skipped_lines.append(f"Line {line_num}: {line}")
             
             # Prepare status messages
@@ -271,15 +266,13 @@ class FlashcardManager:
             
             if skipped_lines:
                 messages.append(f"Skipped {len(skipped_lines)} malformed line(s):")
-                messages.extend(skipped_lines[:5])  # Show first 5 skipped lines
+                messages.extend(skipped_lines[:5])
                 if len(skipped_lines) > 5:
                     messages.append(f"... and {len(skipped_lines) - 5} more")
                 messages.append("\nValid format: 'term - definition' (with spaces around the hyphen)")
-                processing_issues.extend([f"Skipped malformed lines: {len(skipped_lines)}"])
+                processing_issues.append(f"Skipped malformed lines: {len(skipped_lines)}")
             
-            # Check if we had any processing issues that warrant showing debug console
-            has_issues = len(processing_issues) > 0 or len(skipped_lines) > 0
-            
+            has_issues = bool(processing_issues or skipped_lines)
             return len(self.flashcards) > 0, messages, has_issues
             
         except (FileNotFoundError, PermissionError, UnicodeDecodeError) as e:
@@ -290,7 +283,7 @@ class FlashcardManager:
         random.shuffle(self.flashcards)
     
     def get_flashcard(self, index: int) -> Optional[Flashcard]:
-        """Get flashcard by index, returns None if index is invalid."""
+        """Get flashcard by index."""
         if 0 <= index < len(self.flashcards):
             return self.flashcards[index]
         return None
@@ -308,7 +301,7 @@ class FlashcardPanel(wx.Panel):
     def __init__(self, parent):
         super().__init__(parent)
         self.flashcard_manager = FlashcardManager()
-        self.flashcard_manager.set_parent_window(self)  # Set parent for dialogs
+        self.flashcard_manager.set_parent_window(self)
         self.current_selection = -1
         
         self._create_ui()
@@ -348,23 +341,16 @@ class FlashcardPanel(wx.Panel):
         """Setup the layout of UI components."""
         main_sizer = wx.BoxSizer(wx.VERTICAL)
         
-        # Add listbox
         main_sizer.Add(self.flashcard_listbox, 1, wx.EXPAND | wx.ALL, 5)
-        
-        # Add separator
         main_sizer.Add(wx.StaticLine(self), 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 5)
-        
-        # Add status
         main_sizer.Add(self.status_text, 0, wx.ALIGN_CENTER | wx.ALL, 5)
         
-        # Add buttons
+        # Button layout
         button_sizer = wx.BoxSizer(wx.HORIZONTAL)
-        button_sizer.Add(self.open_button, 0, wx.RIGHT, 5)
-        button_sizer.Add(self.shuffle_button, 0, wx.RIGHT, 5)
-        button_sizer.Add(self.reveal_button, 0)
+        for button in [self.open_button, self.shuffle_button, self.reveal_button]:
+            button_sizer.Add(button, 0, wx.RIGHT, 5)
         
         main_sizer.Add(button_sizer, 0, wx.ALIGN_CENTER | wx.ALL, 5)
-        
         self.SetSizer(main_sizer)
     
     def _update_flashcard_list(self):
@@ -382,12 +368,11 @@ class FlashcardPanel(wx.Panel):
         else:
             self.status_text.SetLabel("No flashcards loaded")
         
-        # Reset selection
         self.current_selection = -1
         self._update_button_states()
     
     def _update_button_states(self):
-        """Update button enabled states based on current state."""
+        """Update button enabled states."""
         has_flashcards = len(self.flashcard_manager) > 0
         has_selection = self.current_selection >= 0
         
@@ -398,6 +383,46 @@ class FlashcardPanel(wx.Panel):
         """Handle listbox selection change."""
         self.current_selection = self.flashcard_listbox.GetSelection()
         self._update_button_states()
+    
+    def _show_load_results(self, success, messages, has_issues, filepath):
+        """Show appropriate dialog based on load results."""
+        if not success:
+            error_msg = "Failed to load flashcards."
+            if messages:
+                error_msg += "\n\n" + "\n".join(messages)
+            
+            wx.MessageBox(error_msg, "Load Error", wx.OK | wx.ICON_ERROR)
+            return
+        
+        # Success case
+        success_msg = f"Successfully loaded {len(self.flashcard_manager)} flashcard{'s' if len(self.flashcard_manager) != 1 else ''}"
+        
+        if has_issues:
+            # Show dialog directing user to debug console
+            full_message = success_msg + "\n\n⚠️ Some issues were detected during parsing:\n" + "\n".join(messages)
+            full_message += "\n\n📋 Check the Debug Console (F12) for detailed parsing information."
+            
+            dialog = wx.MessageDialog(
+                self, full_message, "Load Complete with Issues", wx.OK | wx.ICON_WARNING
+            )
+            dialog.SetOKLabel("Continue Anyway")
+            dialog.ShowModal()
+            dialog.Destroy()
+            
+            # Auto-show debug console
+            parent_frame = self.GetParent()
+            if hasattr(parent_frame, 'set_last_opened_file'):
+                parent_frame.set_last_opened_file(filepath)
+            if hasattr(parent_frame, 'on_show_debug'):
+                parent_frame.on_show_debug(None)
+                
+        elif messages:
+            # Show info about successful auto-fixes
+            full_message = success_msg + "\n\n✅ Auto-corrections applied:\n" + "\n".join(messages)
+            wx.MessageBox(full_message, "Load Successful", wx.OK | wx.ICON_INFORMATION)
+        else:
+            # Simple success message
+            wx.MessageBox(success_msg, "Load Successful", wx.OK | wx.ICON_INFORMATION)
     
     def on_open(self, event):
         """Handle open file button click."""
@@ -413,7 +438,7 @@ class FlashcardPanel(wx.Panel):
             if dialog.ShowModal() == wx.ID_OK:
                 filepath = dialog.GetPath()
                 
-                # Track the opened file for debug reloading
+                # Track opened file for debug reloading
                 parent_frame = self.GetParent()
                 if hasattr(parent_frame, 'set_last_opened_file'):
                     parent_frame.set_last_opened_file(filepath)
@@ -422,62 +447,8 @@ class FlashcardPanel(wx.Panel):
                 
                 if success:
                     self._update_flashcard_list()
-                    
-                    # Prepare success message
-                    success_msg = f"Successfully loaded {len(self.flashcard_manager)} flashcard{'s' if len(self.flashcard_manager) != 1 else ''}"
-                    
-                    if has_issues:
-                        # Show dialog directing user to debug console
-                        full_message = success_msg + "\n\n⚠️ Some issues were detected during parsing:\n" + "\n".join(messages)
-                        full_message += "\n\n📋 Check the Debug Console (F12) for detailed parsing information."
-                        
-                        # Create custom dialog with "Continue Anyway" button
-                        dialog = wx.MessageDialog(
-                            self,
-                            full_message,
-                            "Load Complete with Issues",
-                            wx.OK | wx.ICON_WARNING
-                        )
-                        
-                        # Change the OK button text to "Continue Anyway"
-                        dialog.SetOKLabel("Continue Anyway")
-                        
-                        dialog.ShowModal()
-                        dialog.Destroy()
-                        
-                        # Auto-show debug console and track file for reloading
-                        parent_frame = self.GetParent()
-                        if hasattr(parent_frame, 'set_last_opened_file'):
-                            parent_frame.set_last_opened_file(filepath)
-                        if hasattr(parent_frame, 'on_show_debug'):
-                            parent_frame.on_show_debug(None)
-                        
-                    elif messages:
-                        # Show info about successful auto-fixes
-                        full_message = success_msg + "\n\n✅ Auto-corrections applied:\n" + "\n".join(messages)
-                        wx.MessageBox(
-                            full_message,
-                            "Load Successful",
-                            wx.OK | wx.ICON_INFORMATION
-                        )
-                    else:
-                        # Simple success message
-                        wx.MessageBox(
-                            success_msg,
-                            "Load Successful",
-                            wx.OK | wx.ICON_INFORMATION
-                        )
-                else:
-                    # Show error messages
-                    error_msg = "Failed to load flashcards."
-                    if messages:
-                        error_msg += "\n\n" + "\n".join(messages)
-                    
-                    wx.MessageBox(
-                        error_msg,
-                        "Load Error",
-                        wx.OK | wx.ICON_ERROR
-                    )
+                
+                self._show_load_results(success, messages, has_issues, filepath)
     
     def on_shuffle(self, event):
         """Handle shuffle button click."""
@@ -509,100 +480,49 @@ class FlashcardFrame(wx.Frame):
             style=wx.DEFAULT_FRAME_STYLE
         )
         
-        # Create main panel
         self.panel = FlashcardPanel(self)
-        
-        # Setup F12 key for debug window
         self._setup_accelerators()
         
-        # Debug window (initially hidden)
+        # Debug window and file tracking
         self.debug_window = None
-        self.last_opened_file = None  # Track the last opened file for reloading
+        self.last_opened_file = None
         
-        # Center and show
         self.CenterOnScreen()
         self.Show()
     
     def _setup_accelerators(self):
         """Setup keyboard accelerators."""
-        # Create a unique ID for the debug command
         debug_id = wx.NewIdRef()
         
-        # Add F12 accelerator for debug window
         accel_entries = [(wx.ACCEL_NORMAL, wx.WXK_F12, debug_id)]
         accel_table = wx.AcceleratorTable(accel_entries)
         self.SetAcceleratorTable(accel_table)
         
-        # Bind the debug command
         self.Bind(wx.EVT_MENU, self.on_show_debug, id=debug_id)
-    
-    def _create_menu_bar(self):
-        """Create the menu bar."""
-        menubar = wx.MenuBar()
-        
-        # File menu
-        file_menu = wx.Menu()
-        open_item = file_menu.Append(wx.ID_OPEN, "&Open\tCtrl+O", "Open flashcard file")
-        file_menu.AppendSeparator()
-        exit_item = file_menu.Append(wx.ID_EXIT, "E&xit\tCtrl+Q", "Exit application")
-        
-        # Tools menu
-        tools_menu = wx.Menu()
-        shuffle_item = tools_menu.Append(wx.ID_ANY, "&Shuffle\tCtrl+S", "Shuffle flashcards")
-        
-        # Debug menu
-        debug_menu = wx.Menu()
-        debug_window_item = debug_menu.Append(wx.ID_ANY, "&Show Debug Window\tF12", "Show debug console")
-        
-        menubar.Append(file_menu, "&File")
-        menubar.Append(tools_menu, "&Tools")
-        menubar.Append(debug_menu, "&Debug")
-        
-        self.SetMenuBar(menubar)
-        
-        # Bind menu events
-        self.Bind(wx.EVT_MENU, self.panel.on_open, open_item)
-        self.Bind(wx.EVT_MENU, self.on_exit, exit_item)
-        self.Bind(wx.EVT_MENU, self.panel.on_shuffle, shuffle_item)
-        self.Bind(wx.EVT_MENU, self.on_show_debug, debug_window_item)
-        
-        # Add F12 accelerator for debug window
-        accel_entries = [(wx.ACCEL_NORMAL, wx.WXK_F12, debug_window_item.GetId())]
-        accel_table = wx.AcceleratorTable(accel_entries)
-        self.SetAcceleratorTable(accel_table)
     
     def on_show_debug(self, event):
         """Show or create the debug window."""
         if self.debug_window is None or not self.debug_window:
             self.debug_window = DebugWindow(self)
-            # Set the debug window as the target for our debug messages
             self.panel.flashcard_manager.debug_window = self.debug_window
         
         self.debug_window.Show()
         self.debug_window.Raise()
         
-        # If we have a last opened file, reload it to show debug info
+        # Reload file for debug analysis if available
         if self.last_opened_file:
             self.debug_window.log(f"Reloading file for debug analysis: {self.last_opened_file}")
             self.debug_window.log("=" * 50)
-            # Reload the file to capture all debug messages
             success, messages, has_issues = self.panel.flashcard_manager.load_from_file(self.last_opened_file)
             if not success:
                 self.debug_window.log("ERROR: Failed to reload file for debug analysis")
             else:
                 self.debug_window.log(f"Reload complete. Found {len(self.panel.flashcard_manager)} valid flashcards.")
-                # Update the UI with the reloaded data
                 self.panel._update_flashcard_list()
     
     def set_last_opened_file(self, filepath):
         """Set the last opened file path for debug reloading."""
         self.last_opened_file = filepath
-    
-    def on_exit(self, event):
-        """Handle exit menu item."""
-        if self.debug_window:
-            self.debug_window.Close()
-        self.Close()
 
 class DebugWindow(wx.Frame):
     """Debug console window."""
